@@ -56,7 +56,12 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
 
         do {
-            let toolpath = try GCodeParser.parse(from: request.fileURL, limits: .quickLook)
+            let toolpath = try GCodeParser.parse(
+                from: request.fileURL,
+                limits: .quickLook,
+                outputSegmentBudget: GCodeParser.thumbnailSegmentBudget,
+                computesStatistics: false
+            )
             let scene = ToolpathSceneBuilder.buildTopDownScene(from: toolpath)
             let maxSize = request.maximumSize
             let size = CGSize(width: min(maxSize.width, 512), height: min(maxSize.height, 512))

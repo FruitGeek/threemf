@@ -28,10 +28,16 @@ public enum GCodeParser {
     /// Hard cap on segment count for the CLI (Quick Look uses ``ResourceLimits/quickLook``).
     public static let maxSegments = ResourceLimits.cli.maxGCodeSegments
 
+    /// Finder thumbnail budget. The parser still walks the whole file (so the silhouette
+    /// spans the print) but keeps at most this many segments via online stride doubling.
+    public static let thumbnailSegmentBudget = 32768
+
     public static func parse(
         from fileURL: URL,
         limits: ResourceLimits = .cli,
-        cancellation: ParseCancellation? = nil
+        cancellation: ParseCancellation? = nil,
+        outputSegmentBudget: Int? = nil,
+        computesStatistics: Bool = true
     ) throws -> ToolpathData {
         let data: Data
         do {
@@ -42,13 +48,21 @@ public enum GCodeParser {
         guard !data.isEmpty else {
             throw GCodeParserError.noSegments
         }
-        return try parse(data: data, limits: limits, cancellation: cancellation)
+        return try parse(
+            data: data,
+            limits: limits,
+            cancellation: cancellation,
+            outputSegmentBudget: outputSegmentBudget,
+            computesStatistics: computesStatistics
+        )
     }
 
     public static func parse(
         data: Data,
         limits: ResourceLimits = .cli,
-        cancellation: ParseCancellation? = nil
+        cancellation: ParseCancellation? = nil,
+        outputSegmentBudget: Int? = nil,
+        computesStatistics: Bool = true
     ) throws -> ToolpathData {
         var segments: [ToolpathSegment] = []
         var pos = simd_float3(0, 0, 0)
@@ -59,6 +73,11 @@ public enum GCodeParser {
         var totalExtrudedMM: Float = 0
         var totalTravelMM: Float = 0
         var estimatedSeconds: Double = 0
+        let downsampleBudget: Int? = outputSegmentBudget.map { requested in
+            max(2, min(requested, limits.maxGCodeSegments))
+        }
+        var keepStride = 1
+        var moveIndex = 0
 
         try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
@@ -160,31 +179,51 @@ public enum GCodeParser {
 
                 let newPos = simd_float3(newX, newY, newZ)
                 let extrudes = sawE && newE > lastE
-                let segment = ToolpathSegment(
-                    start: pos,
-                    end: newPos,
-                    extrudes: extrudes,
-                    feedrate: feedrate,
-                    layerIndex: layerIndex
-                )
-                let len = segment.length
-                if len > 0 {
-                    if extrudes {
-                        totalExtrudedMM += len
-                    } else {
-                        totalTravelMM += len
+                var keepsSegment = true
+                if let budget = downsampleBudget {
+                    if segments.count >= budget {
+                        compactEvenIndices(&segments)
+                        if keepStride < Int.max / 2 {
+                            keepStride *= 2
+                        }
                     }
-                    if feedrate > 0 {
-                        estimatedSeconds += Double(len) / Double(feedrate / 60)
+                    keepsSegment = moveIndex % keepStride == 0
+                    moveIndex += 1
+                }
+
+                if computesStatistics || keepsSegment {
+                    let segment = ToolpathSegment(
+                        start: pos,
+                        end: newPos,
+                        extrudes: extrudes,
+                        feedrate: feedrate,
+                        layerIndex: layerIndex
+                    )
+                    if computesStatistics {
+                        let len = segment.length
+                        if len > 0 {
+                            if extrudes {
+                                totalExtrudedMM += len
+                            } else {
+                                totalTravelMM += len
+                            }
+                            if feedrate > 0 {
+                                estimatedSeconds += Double(len) / Double(feedrate / 60)
+                            }
+                        }
+                    }
+                    if keepsSegment {
+                        segments.append(segment)
                     }
                 }
-                segments.append(segment)
                 pos = newPos
                 lastE = newE
 
-                if segments.count >= limits.maxGCodeSegments {
-                    log.notice("GCodeParser: reached maxSegments cap (\(limits.maxGCodeSegments)); truncating")
-                    break
+                if downsampleBudget == nil {
+                    if segments.count >= limits.maxGCodeSegments {
+                        log.notice("GCodeParser: reached maxSegments cap (\(limits.maxGCodeSegments)); truncating")
+                        break
+                    }
                 }
             }
         }
@@ -207,6 +246,19 @@ public enum GCodeParser {
             totalTravelMM: totalTravelMM,
             estimatedSeconds: safeSeconds
         )
+    }
+
+    /// Drops odd indices so a full buffer of `budget` samples becomes ~`budget/2`.
+    /// Combined with doubling `keepStride`, later moves still land in the kept set.
+    private static func compactEvenIndices(_ segments: inout [ToolpathSegment]) {
+        var write = 0
+        for read in stride(from: 0, to: segments.count, by: 2) {
+            if write != read {
+                segments[write] = segments[read]
+            }
+            write += 1
+        }
+        segments.removeSubrange(write...)
     }
 
     /// Inline float parser over a byte range. Handles sign, fraction, exponent.

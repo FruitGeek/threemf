@@ -24,7 +24,7 @@ struct ThreeMFExtractorPlatesTests {
     func listPlatesDedup() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("plates-\(UUID().uuidString)").appendingPathExtension("3mf")
-        let archive = try Archive(url: url, accessMode: .create)
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         let png = Data([0x89, 0x50, 0x4E, 0x47]) // dummy PNG-ish bytes
         // Two real plates, each with the full set of Bambu variant PNGs + noise.
         for path in [
@@ -36,8 +36,11 @@ struct ThreeMFExtractorPlatesTests {
             try archive.addEntry(
                 with: path,
                 type: .file,
-                uncompressedSize: UInt32(png.count),
-                provider: { p, n in png.subdata(in: p ..< p + n) }
+                uncompressedSize: Int64(png.count),
+                provider: { position, size in
+                    let start = Int(position)
+                    return png.subdata(in: start ..< start + size)
+                }
             )
         }
         defer { try? FileManager.default.removeItem(at: url) }

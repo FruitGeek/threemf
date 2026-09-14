@@ -82,14 +82,15 @@ struct FuzzingTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("fuzz-\(UUID().uuidString)")
             .appendingPathExtension("3mf")
-        let archive = try Archive(url: url, accessMode: .create)
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         let data = modelXML.data(using: .utf8) ?? Data()
         try archive.addEntry(
             with: "3D/3dmodel.model",
             type: .file,
-            uncompressedSize: UInt32(data.count),
+            uncompressedSize: Int64(data.count),
             provider: { position, size in
-                data.subdata(in: position ..< position + size)
+                let start = Int(position)
+                return data.subdata(in: start ..< start + size)
             }
         )
         return url

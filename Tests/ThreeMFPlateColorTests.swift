@@ -46,14 +46,17 @@ struct ThreeMFPlateColorTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("plate-color-\(UUID().uuidString)")
             .appendingPathExtension("3mf")
-        let archive = try Archive(url: url, accessMode: .create)
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         func add(_ path: String, _ string: String) throws {
             let data = Data(string.utf8)
             try archive.addEntry(
                 with: path,
                 type: .file,
-                uncompressedSize: UInt32(data.count),
-                provider: { position, size in data.subdata(in: position ..< position + size) }
+                uncompressedSize: Int64(data.count),
+                provider: { position, size in
+                    let start = Int(position)
+                    return data.subdata(in: start ..< start + size)
+                }
             )
         }
         try add("3D/3dmodel.model", Self.rootModel)
@@ -112,14 +115,17 @@ struct ThreeMFPlateColorTests {
     func paintOverride() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("painted-\(UUID().uuidString)").appendingPathExtension("3mf")
-        let archive = try Archive(url: url, accessMode: .create)
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         func add(_ path: String, _ s: String) throws {
             let data = Data(s.utf8)
             try archive.addEntry(
                 with: path,
                 type: .file,
-                uncompressedSize: UInt32(data.count),
-                provider: { p, n in data.subdata(in: p ..< p + n) }
+                uncompressedSize: Int64(data.count),
+                provider: { position, size in
+                    let start = Int(position)
+                    return data.subdata(in: start ..< start + size)
+                }
             )
         }
         try add("3D/3dmodel.model", Self.paintedModel)

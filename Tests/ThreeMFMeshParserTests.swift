@@ -223,18 +223,16 @@ class ThreeMFMeshParserTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("3mf")
         // Create a ZIP with no 3D/3dmodel.model
-        guard let archive = Archive(url: url, accessMode: .create) else {
-            XCTFail("Cannot create archive")
-            return
-        }
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         let dummyData = "hello".data(using: .utf8)!
         // S8 fix: surface real fixture-setup errors instead of silently swallowing.
         try archive.addEntry(
             with: "dummy.txt",
             type: .file,
-            uncompressedSize: UInt32(dummyData.count),
+            uncompressedSize: Int64(dummyData.count),
             provider: { position, size in
-                dummyData.subdata(in: position ..< position + size)
+                let start = Int(position)
+                return dummyData.subdata(in: start ..< start + size)
             }
         )
         defer { try? FileManager.default.removeItem(at: url) }
@@ -267,7 +265,7 @@ class ThreeMFMeshParserTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("3mf")
-        try try XCTUnwrap("not a zip".data(using: .utf8)?.write(to: url))
+        try XCTUnwrap("not a zip".data(using: .utf8)).write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
 
         XCTAssertThrowsError(try ThreeMFMeshParser.parseMesh(from: url))
@@ -328,23 +326,21 @@ class ThreeMFMeshParserTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("3mf")
-        guard let archive = Archive(url: url, accessMode: .create) else {
-            XCTFail("Cannot create archive")
-            return
-        }
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         defer { try? FileManager.default.removeItem(at: url) }
 
         let smallData = Data([0x89, 0x50, 0x4E, 0x47])
         // Declare size as 11 MB (exceeds 10 MB limit)
-        let declaredSize: UInt32 = 11 * 1024 * 1024
+        let declaredSize: Int64 = 11 * 1024 * 1024
         try archive.addEntry(
             with: "Metadata/plate_1.png",
             type: .file,
             uncompressedSize: declaredSize,
             provider: { position, size in
-                let end = min(position + size, smallData.count)
-                guard position < smallData.count else { return Data() }
-                return smallData.subdata(in: position ..< end)
+                let start = Int(position)
+                let end = min(start + size, smallData.count)
+                guard start < smallData.count else { return Data() }
+                return smallData.subdata(in: start ..< end)
             }
         )
 
@@ -407,26 +403,24 @@ class ThreeMFMeshParserTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("3mf")
-        guard let archive = Archive(url: url, accessMode: .create) else {
-            XCTFail("Cannot create archive"); return
-        }
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
         defer { try? FileManager.default.removeItem(at: url) }
 
         // Declare 1 KB, but stream 600 MB (above the 500 MB cap).
-        let declared: UInt32 = 1024
+        let declared: Int64 = 1024
         let streamTotal = 600 * 1024 * 1024
         let chunkSize = 1024 * 1024
         let chunk = Data(count: chunkSize)
         try archive.addEntry(
             with: "3D/3dmodel.model",
             type: .file,
-            uncompressedSize: UInt32(declared),
+            uncompressedSize: declared,
             provider: { position, size in
                 // Provider is asked for `size` bytes starting at `position`. We
                 // serve raw zero bytes regardless of `position`, but ZIPFoundation
                 // will keep asking based on declared size — so we must extend by
                 // forcibly returning huge buffers.
-                guard position < streamTotal else { return Data() }
+                guard position < Int64(streamTotal) else { return Data() }
                 let take = min(size, chunkSize)
                 _ = chunk
                 return Data(count: take)
@@ -440,10 +434,7 @@ class ThreeMFMeshParserTests: XCTestCase {
             // Acceptable outcomes: cannotOpenArchive, modelNotFound, parseFailed,
             // noMeshData, sizeLimitExceeded. Any of these proves we did not crash
             // or run away with memory.
-            XCTAssertTrue(
-                error is ThreeMFMeshParserError || error is NSError,
-                "Unexpected error type: \(error)"
-            )
+            XCTAssertTrue(error is ThreeMFMeshParserError, "Unexpected error type: \(error)")
         }
     }
 
@@ -692,18 +683,17 @@ class ThreeMFMeshParserTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("3mf")
-        guard let archive = Archive(url: url, accessMode: .create) else {
-            throw NSError(domain: "test", code: 1)
-        }
+        let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
 
         for entry in entries {
             let data = entry.content
             try archive.addEntry(
                 with: entry.path,
                 type: .file,
-                uncompressedSize: UInt32(data.count),
+                uncompressedSize: Int64(data.count),
                 provider: { position, size in
-                    data.subdata(in: position ..< position + size)
+                    let start = Int(position)
+                    return data.subdata(in: start ..< start + size)
                 }
             )
         }

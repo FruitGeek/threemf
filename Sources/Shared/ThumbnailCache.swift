@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 
 /// Disk-backed cache for rendered thumbnail PNGs, keyed by `(SHA-256(path), size, mtime)`.
 ///
@@ -19,6 +20,31 @@ public enum ThumbnailCache {
     /// but a soft cap bounds growth in the meantime — important for power users with many 3D files.
     private static let maxCacheBytes: Int = 100 * 1024 * 1024 // 100 MB
 
+    private struct Runtime {
+        var directory: URL?
+        var maxCacheBytes: Int?
+        var trackedDirectory: URL?
+        var trackedBytes: Int?
+        var storesSinceScan = 0
+        var directoryScanCount = 0
+    }
+
+    /// Test isolation: production never sets this. Lets tests use a temp directory and a
+    /// tiny cap without touching the user's real thumbnail cache.
+    private static let runtime = OSAllocatedUnfairLock(initialState: Runtime())
+
+    /// Runs `body` against an isolated cache directory and byte cap, then restores production
+    /// defaults. Not reentrant.
+    static func withIsolatedCache<T>(
+        directory: URL,
+        maxBytes: Int,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        runtime.withLock { $0 = Runtime(directory: directory, maxCacheBytes: maxBytes) }
+        defer { runtime.withLock { $0 = Runtime() } }
+        return try body()
+    }
+
     /// Returns cached PNG data for `url` if a fresh entry exists, else nil.
     /// `extraKey` lets a single source file produce multiple cache entries (e.g. per
     /// plate for Bambu 3MFs) without aliasing — the key combines source path/size/mtime
@@ -36,10 +62,20 @@ public enum ThumbnailCache {
         let dir = cacheDirectory()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = cacheFileURL(for: key)
-        try? data.write(to: file, options: .atomic)
-        // Opportunistic LRU eviction. Probabilistic to avoid running on every store —
-        // 1-in-32 chance keeps amortized cost low while still bounding growth over time.
-        if Int.random(in: 0 ..< 32) == 0 {
+        let previousBytes = fileSize(at: file)
+        do {
+            try data.write(to: file, options: .atomic)
+        } catch {
+            return
+        }
+
+        // Scan once to establish the process-local total, then update it by write deltas.
+        // A deterministic periodic rescan reconciles writes from other processes and OS
+        // cache eviction. Crossing the cap always triggers an immediate LRU scan.
+        if shouldScanAfterStore(
+            directory: dir,
+            byteDelta: data.count - previousBytes
+        ) {
             evictIfOversized()
         }
     }
@@ -61,17 +97,23 @@ public enum ThumbnailCache {
             return (url, size, values?.contentAccessDate ?? .distantPast)
         }
         var totalBytes = stats.reduce(0) { $0 + $1.size }
-        guard totalBytes > maxCacheBytes else { return }
-
-        // Oldest-accessed first.
-        let oldestFirst = stats.sorted { $0.accessed < $1.accessed }
-        for entry in oldestFirst {
-            if totalBytes <= maxCacheBytes {
-                break
+        let cap = resolvedMaxCacheBytes()
+        if totalBytes > cap {
+            // Oldest-accessed first.
+            let oldestFirst = stats.sorted { $0.accessed < $1.accessed }
+            for entry in oldestFirst {
+                if totalBytes <= cap {
+                    break
+                }
+                do {
+                    try fm.removeItem(at: entry.url)
+                    totalBytes -= entry.size
+                } catch {
+                    continue
+                }
             }
-            try? fm.removeItem(at: entry.url)
-            totalBytes -= entry.size
         }
+        recordDirectoryScan(directory: dir, totalBytes: totalBytes)
     }
 
     // MARK: - Internal
@@ -94,7 +136,47 @@ public enum ThumbnailCache {
         return "\(pathHash)-\(size)-\(Int(mtime.timeIntervalSince1970))"
     }
 
+    private static func resolvedMaxCacheBytes() -> Int {
+        runtime.withLock { $0.maxCacheBytes } ?? maxCacheBytes
+    }
+
+    private static func fileSize(at url: URL) -> Int {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+    }
+
+    private static func shouldScanAfterStore(directory: URL, byteDelta: Int) -> Bool {
+        runtime.withLock { state in
+            guard
+                state.trackedDirectory == directory,
+                let trackedBytes = state.trackedBytes
+            else {
+                return true
+            }
+            let updatedBytes = max(0, trackedBytes + byteDelta)
+            state.trackedBytes = updatedBytes
+            state.storesSinceScan += 1
+            return updatedBytes > (state.maxCacheBytes ?? maxCacheBytes)
+                || state.storesSinceScan >= 32
+        }
+    }
+
+    private static func recordDirectoryScan(directory: URL, totalBytes: Int) {
+        runtime.withLock { state in
+            state.trackedDirectory = directory
+            state.trackedBytes = totalBytes
+            state.storesSinceScan = 0
+            state.directoryScanCount += 1
+        }
+    }
+
+    static var testDirectoryScanCount: Int {
+        runtime.withLock { $0.directoryScanCount }
+    }
+
     private static func cacheDirectory() -> URL {
+        if let override = runtime.withLock({ $0.directory }) {
+            return override
+        }
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return caches.appendingPathComponent(subdirectory, isDirectory: true)

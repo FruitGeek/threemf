@@ -163,4 +163,47 @@ final class GCodeParserTests: XCTestCase {
         // First travel is X0→X0 Z0→Z0.2 (0.2 mm @ 600 = 0.02 s) + 10mm at 600 = 1.0 s.
         XCTAssertEqual(toolpath.estimatedSeconds, 1.02, accuracy: 0.01)
     }
+
+    func testParse_outputSegmentBudget_capsCountButSpansWholeFile() throws {
+        var lines = ["G0 X0 Y0 Z0.2 F600"]
+        for i in 1 ... 256 {
+            lines.append("G1 X\(i) Y0 E\(i)")
+        }
+        let url = try writeTempFile(string: lines.joined(separator: "\n"))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let full = try GCodeParser.parse(from: url)
+        XCTAssertEqual(full.segments.count, 257)
+
+        let sampled = try GCodeParser.parse(from: url, outputSegmentBudget: 16)
+        XCTAssertLessThanOrEqual(sampled.segments.count, 16)
+        XCTAssertGreaterThan(sampled.segments.count, 4)
+        XCTAssertEqual(sampled.totalExtrudedMM, full.totalExtrudedMM, accuracy: 0.01)
+        XCTAssertEqual(sampled.segments.first?.start.x ?? -.infinity, 0, accuracy: 0.001)
+        XCTAssertGreaterThan(sampled.segments.last?.end.x ?? 0, 128)
+        XCTAssertEqual(sampled.layerCount, full.layerCount)
+    }
+
+    func testParse_withoutStatisticsStillKeepsThumbnailMetadata() throws {
+        let gcode = """
+        G0 X0 Y0 Z0.2 F600
+        G1 X10 Y0 E1
+        G0 X10 Y10 Z0.4
+        G1 X0 Y10 E2
+        """
+        let url = try writeTempFile(string: gcode)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let toolpath = try GCodeParser.parse(
+            from: url,
+            outputSegmentBudget: 3,
+            computesStatistics: false
+        )
+
+        XCTAssertLessThanOrEqual(toolpath.segments.count, 3)
+        XCTAssertEqual(toolpath.layerCount, 2)
+        XCTAssertEqual(toolpath.totalExtrudedMM, 0)
+        XCTAssertEqual(toolpath.totalTravelMM, 0)
+        XCTAssertEqual(toolpath.estimatedSeconds, 0)
+    }
 }

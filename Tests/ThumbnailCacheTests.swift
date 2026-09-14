@@ -83,4 +83,64 @@ final class ThumbnailCacheTests: XCTestCase {
         ThumbnailCache.store(Data(), for: url)
         XCTAssertNil(ThumbnailCache.cachedThumbnail(for: url))
     }
+
+    func testStore_evictsOldestWhenOverCap() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cache-iso-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let blob = Data(repeating: 0xAB, count: 40)
+        let a = try makeSourceFile(content: "a")
+        let b = try makeSourceFile(content: "b")
+        let c = try makeSourceFile(content: "c")
+        defer {
+            try? FileManager.default.removeItem(at: a)
+            try? FileManager.default.removeItem(at: b)
+            try? FileManager.default.removeItem(at: c)
+        }
+
+        try ThumbnailCache.withIsolatedCache(directory: dir, maxBytes: 90) {
+            ThumbnailCache.store(blob, for: a)
+            let afterA = try FileManager.default.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+            XCTAssertEqual(afterA.count, 1)
+            var oldest = afterA[0]
+            var stale = URLResourceValues()
+            stale.contentAccessDate = Date.distantPast
+            try oldest.setResourceValues(stale)
+
+            ThumbnailCache.store(blob, for: b)
+            ThumbnailCache.store(blob, for: c)
+
+            XCTAssertNil(ThumbnailCache.cachedThumbnail(for: a))
+            XCTAssertEqual(ThumbnailCache.cachedThumbnail(for: b), blob)
+            XCTAssertEqual(ThumbnailCache.cachedThumbnail(for: c), blob)
+        }
+    }
+
+    func testStore_reusesTrackedSizeBelowCap() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cache-iso-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let a = try makeSourceFile(content: "a")
+        let b = try makeSourceFile(content: "b")
+        defer {
+            try? FileManager.default.removeItem(at: a)
+            try? FileManager.default.removeItem(at: b)
+        }
+
+        ThumbnailCache.withIsolatedCache(directory: dir, maxBytes: 1024) {
+            ThumbnailCache.store(png, for: a)
+            XCTAssertEqual(ThumbnailCache.testDirectoryScanCount, 1)
+
+            ThumbnailCache.store(png, for: b)
+            XCTAssertEqual(ThumbnailCache.testDirectoryScanCount, 1)
+        }
+    }
 }

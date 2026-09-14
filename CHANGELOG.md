@@ -4,6 +4,15 @@ All notable changes to threemf are documented here. Format: Keep a Changelog. Ve
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-09-14
+
+### Changed
+- **G-code Finder thumbnails downsample the toolpath**: the thumbnail path still reads the whole file (so the silhouette spans the print) but keeps at most 32,768 segments via online stride doubling, instead of building a SceneKit line geometry for up to 2 million Quick Look segments. Discarded moves no longer allocate segment values or compute length/ETA statistics that Finder thumbnails do not display.
+- **Thumbnail cache eviction is deterministic and cheaper**: every store that pushes the cache past the 100 MB soft cap LRU-evicts immediately. A process-local byte total avoids walking the directory after every under-budget store, with a deterministic periodic rescan to reconcile other processes and macOS cache eviction. The previous 1-in-32 random skip could leave the cache over budget across many stores.
+
+### Added
+- **3MF and G-code performance budgets**: `PerformanceTests` now times synthetic 3MF and G-code parses against the same wall-clock budgets as STL (0.250 s small / 1.500 s large), plus end-to-end 3MF and G-code parse → SceneKit → 256 px snapshot budgets.
+
 ## [1.5.1] - 2026-09-14
 
 ### Security

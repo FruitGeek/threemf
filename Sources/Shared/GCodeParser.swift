@@ -23,23 +23,33 @@ public enum GCodeParserError: Error, LocalizedError {
 /// one `ToolpathSegment` per move. Layer boundaries detected by Z increase.
 public enum GCodeParser {
     /// Hard cap on file size before parsing — bounds memory.
-    public static let maxFileSize = 500 * 1024 * 1024
+    public static let maxFileSize = ResourceLimits.cli.maxGCodeFileBytes
 
-    /// Hard cap on segment count to prevent OOM via crafted input.
-    public static let maxSegments = 20_000_000
+    /// Hard cap on segment count for the CLI (Quick Look uses ``ResourceLimits/quickLook``).
+    public static let maxSegments = ResourceLimits.cli.maxGCodeSegments
 
-    public static func parse(from fileURL: URL) throws -> ToolpathData {
-        let data = try Data(contentsOf: fileURL)
-        guard data.count <= maxFileSize else {
+    public static func parse(
+        from fileURL: URL,
+        limits: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil
+    ) throws -> ToolpathData {
+        let data: Data
+        do {
+            data = try BoundedFileReader.dataContents(of: fileURL, maxByteCount: limits.maxGCodeFileBytes)
+        } catch BoundedFileReader.ReadError.fileTooLarge {
             throw GCodeParserError.fileTooLarge
         }
         guard !data.isEmpty else {
             throw GCodeParserError.noSegments
         }
-        return try parse(data: data)
+        return try parse(data: data, limits: limits, cancellation: cancellation)
     }
 
-    public static func parse(data: Data) throws -> ToolpathData {
+    public static func parse(
+        data: Data,
+        limits: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil
+    ) throws -> ToolpathData {
         var segments: [ToolpathSegment] = []
         var pos = simd_float3(0, 0, 0)
         var lastE: Float = 0
@@ -56,14 +66,20 @@ public enum GCodeParser {
             }
             let count = raw.count
             var i = 0
+            var poller = CancellationPoller(cancellation)
 
             while i < count {
+                try poller.tick()
                 // Find end of line.
                 var lineEnd = i
                 while lineEnd < count, base[lineEnd] != 0x0A {
+                    try poller.tick()
                     lineEnd += 1
                 }
                 defer { i = lineEnd + 1 }
+                // Real G-code lines are tiny. Bounding pathological lines also bounds all
+                // secondary scans over the same range after the cancellable newline search.
+                guard lineEnd - i <= 1_048_576 else { continue }
 
                 // Skip leading whitespace.
                 var p = i
@@ -166,8 +182,8 @@ public enum GCodeParser {
                 pos = newPos
                 lastE = newE
 
-                if segments.count >= maxSegments {
-                    log.notice("GCodeParser: reached maxSegments cap (\(Self.maxSegments)); truncating")
+                if segments.count >= limits.maxGCodeSegments {
+                    log.notice("GCodeParser: reached maxSegments cap (\(limits.maxGCodeSegments)); truncating")
                     break
                 }
             }

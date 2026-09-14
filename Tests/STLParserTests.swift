@@ -1,3 +1,4 @@
+import os
 import SceneKit
 import simd
 import XCTest
@@ -123,7 +124,7 @@ class STLParserTests: XCTestCase {
             indices: [0, 1, 2],
             normals: nil
         )
-        mesh.computeNormals()
+        try mesh.computeNormals()
 
         XCTAssertNotNil(mesh.normals)
         // Normal should point in +Z direction for this CCW triangle in XY plane
@@ -166,19 +167,19 @@ class STLParserTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let expectation = XCTestExpectation(description: "parse returns within timeout")
-        var thrown: Error?
+        let threw = OSAllocatedUnfairLock(initialState: false)
         DispatchQueue.global().async {
             do {
                 _ = try STLParser.parseMesh(from: url)
             } catch {
-                thrown = error
+                threw.withLock { $0 = true }
             }
             expectation.fulfill()
         }
         // Test timeout safety net: if reserveCapacity were honored unclamped this
         // would either OOM or take far longer than 5s.
         wait(for: [expectation], timeout: 5.0)
-        XCTAssertNotNil(thrown, "Expected an error from invalid STL")
+        XCTAssertTrue(threw.withLock { $0 }, "Expected an error from invalid STL")
     }
 
     // MARK: - Helpers

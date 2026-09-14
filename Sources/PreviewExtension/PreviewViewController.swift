@@ -52,6 +52,45 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     private weak var layerScrubber: LayerScrubber?
     private var animationTask: Task<Void, Never>?
     private var toolpathColorMode: ToolpathSceneBuilder.ColorMode = .layerRainbow
+    /// Bumped when a new preview starts so in-flight background parses cannot mutate UI after dismiss.
+    private var previewLoadGeneration: UInt64 = 0
+    /// Cancellation for the parse owning `previewLoadGeneration`. Superseding or dismissing a
+    /// preview cancels it so the worker stops rather than finishing a result nobody will see.
+    private var previewCancellation: ParseCancellation?
+
+    /// Identity of one preview load: the generation that gates UI updates, and the token that
+    /// stops the parse itself.
+    private struct PreviewLoad: Sendable {
+        let generation: UInt64
+        let cancellation: ParseCancellation
+    }
+
+    private func beginPreviewLoad() -> PreviewLoad {
+        endPreviewLoad()
+        animationTask?.cancel()
+        animationTask = nil
+        view.subviews.forEach { $0.removeFromSuperview() }
+        axisGizmoNode = nil
+        bedGridNode = nil
+        let load = PreviewLoad(generation: previewLoadGeneration, cancellation: ParseCancellation())
+        previewCancellation = load.cancellation
+        return load
+    }
+
+    private func endPreviewLoad() {
+        previewCancellation?.cancel()
+        previewCancellation = nil
+        previewLoadGeneration += 1
+    }
+
+    private func isPreviewLoadCurrent(_ generation: UInt64) -> Bool {
+        generation == previewLoadGeneration
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        endPreviewLoad()
+    }
 
     override func loadView() {
         let v = KeyableView()
@@ -94,6 +133,9 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     }
 
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
+        let load = beginPreviewLoad()
+        let loadGeneration = load.generation
+        let cancellation = load.cancellation
         fileURL = url
         fileSizeBytes = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init) ?? 0
         let ext = url.pathExtension.lowercased()
@@ -106,34 +148,42 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
 
         switch ext {
         case "3mf":
-            prepare3MFPreview(url: url, handler: handler)
+            prepare3MFPreview(url: url, load: load, handler: handler)
         case "stl":
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let mesh = try STLParser.parseMesh(from: url)
+                    let mesh = try STLParser.parseMesh(from: url, limits: .quickLook, cancellation: cancellation)
                     DispatchQueue.main.async {
-                        self.show3DScene(from: mesh)
+                        if self.isPreviewLoadCurrent(loadGeneration) {
+                            self.show3DScene(from: mesh)
+                        }
                         h(nil)
                     }
                 } catch {
                     log.error("STL parse failed: \(error.localizedDescription, privacy: .public)")
                     DispatchQueue.main.async {
-                        h(PreviewError.meshLoadFailed(underlying: error))
+                        h(self.isPreviewLoadCurrent(loadGeneration)
+                            ? PreviewError.meshLoadFailed(underlying: error)
+                            : nil)
                     }
                 }
             }
         case "gcode":
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let toolpath = try GCodeParser.parse(from: url)
+                    let toolpath = try GCodeParser.parse(from: url, limits: .quickLook, cancellation: cancellation)
                     DispatchQueue.main.async {
-                        self.showToolpathScene(from: toolpath)
+                        if self.isPreviewLoadCurrent(loadGeneration) {
+                            self.showToolpathScene(from: toolpath)
+                        }
                         h(nil)
                     }
                 } catch {
                     log.error("G-code parse failed: \(error.localizedDescription, privacy: .public)")
                     DispatchQueue.main.async {
-                        h(PreviewError.meshLoadFailed(underlying: error))
+                        h(self.isPreviewLoadCurrent(loadGeneration)
+                            ? PreviewError.meshLoadFailed(underlying: error)
+                            : nil)
                     }
                 }
             }
@@ -298,24 +348,38 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         }
     }
 
-    private func prepare3MFPreview(url: URL, handler: @escaping (Error?) -> Void) {
+    private func prepare3MFPreview(
+        url: URL,
+        load: PreviewLoad,
+        handler: @escaping (Error?) -> Void
+    ) {
         // Same Sendable opt-out as preparePreviewOfFile — handler is always called from main.
         nonisolated(unsafe) let h = handler
+        let loadGeneration = load.generation
+        let cancellation = load.cancellation
 
         // For small 3MFs, parsing the full mesh is fast enough that the embedded-thumbnail
         // detour is unnecessary friction. Load 3D directly.
         if fileSizeBytes > 0, fileSizeBytes < Self.autoLoad3DSizeThreshold {
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let mesh = try ThreeMFMeshParser.parseMesh(from: url)
+                    let mesh = try ThreeMFMeshParser.parseMesh(
+                        from: url,
+                        limits: .quickLook,
+                        cancellation: cancellation
+                    )
                     DispatchQueue.main.async {
-                        self.show3DScene(from: mesh)
+                        if self.isPreviewLoadCurrent(loadGeneration) {
+                            self.show3DScene(from: mesh)
+                        }
                         h(nil)
                     }
                 } catch {
                     log.error("Auto-load 3MF parse failed: \(error.localizedDescription, privacy: .public)")
                     DispatchQueue.main.async {
-                        h(PreviewError.meshLoadFailed(underlying: error))
+                        h(self.isPreviewLoadCurrent(loadGeneration)
+                            ? PreviewError.meshLoadFailed(underlying: error)
+                            : nil)
                     }
                 }
             }
@@ -331,11 +395,11 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         // Fall back to the legacy single-thumbnail extractor when no plates were found.
         let firstImage: NSImage? = if !plates.isEmpty,
                                       let data = try? ThreeMFExtractor.extractPlate(plates[0], from: url),
-                                      let img = NSImage(data: data)
+                                      let img = SafePNGValidator.nsImage(fromPNG: data)
         {
             img
         } else if let imageData = try? ThreeMFExtractor.extractThumbnail(from: url) {
-            NSImage(data: imageData)
+            SafePNGValidator.nsImage(fromPNG: imageData)
         } else {
             nil
         }
@@ -359,15 +423,23 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             // No thumbnail at all — fall back to direct 3D load.
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let mesh = try ThreeMFMeshParser.parseMesh(from: url)
+                    let mesh = try ThreeMFMeshParser.parseMesh(
+                        from: url,
+                        limits: .quickLook,
+                        cancellation: cancellation
+                    )
                     DispatchQueue.main.async {
-                        self.show3DScene(from: mesh)
+                        if self.isPreviewLoadCurrent(loadGeneration) {
+                            self.show3DScene(from: mesh)
+                        }
                         h(nil)
                     }
                 } catch {
                     log.error("3MF mesh parse failed: \(error.localizedDescription, privacy: .public)")
                     DispatchQueue.main.async {
-                        h(PreviewError.meshLoadFailed(underlying: error))
+                        h(self.isPreviewLoadCurrent(loadGeneration)
+                            ? PreviewError.meshLoadFailed(underlying: error)
+                            : nil)
                     }
                 }
             }
@@ -451,7 +523,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         currentPlateIndex = next
         if let imageView = plateImageView,
            let data = try? ThreeMFExtractor.extractPlate(plates[next], from: url),
-           let image = NSImage(data: data)
+           let image = SafePNGValidator.nsImage(fromPNG: data)
         {
             imageView.image = image
         }
@@ -474,6 +546,9 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
 
     @objc private func show3DButtonTapped(_ sender: NSView) {
         guard let url = fileURL else { return }
+        let load = beginPreviewLoad()
+        let loadGeneration = load.generation
+        let cancellation = load.cancellation
 
         // Replace button with progress overlay
         sender.removeFromSuperview()
@@ -488,12 +563,19 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         DispatchQueue.global(qos: .userInitiated).async {
             let progressCallback: (Float) -> Void = { fraction in
                 DispatchQueue.main.async {
+                    guard self.isPreviewLoadCurrent(loadGeneration) else { return }
                     overlay.progress = Double(fraction)
                 }
             }
             do {
-                let mesh = try ThreeMFMeshParser.parseMesh(from: url, progress: progressCallback)
+                let mesh = try ThreeMFMeshParser.parseMesh(
+                    from: url,
+                    limits: .quickLook,
+                    cancellation: cancellation,
+                    progress: progressCallback
+                )
                 DispatchQueue.main.async {
+                    guard self.isPreviewLoadCurrent(loadGeneration) else { return }
                     for subview in self.view.subviews {
                         subview.removeFromSuperview()
                     }
@@ -502,6 +584,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             } catch {
                 log.error("3MF Show3D parse failed: \(error.localizedDescription, privacy: .public)")
                 DispatchQueue.main.async {
+                    guard self.isPreviewLoadCurrent(loadGeneration) else { return }
                     self.replaceOverlayWithError(overlay: overlay, error: error)
                 }
             }

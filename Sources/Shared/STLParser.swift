@@ -19,19 +19,32 @@ public enum STLParserError: Error, LocalizedError {
 
 public enum STLParser {
     /// Hard cap on triangles to prevent OOM via crafted headers (UInt32 max is ~4.2B).
-    public static let maxTriangles = 50_000_000
+    public static let maxTriangles = ResourceLimits.cli.maxSTLTriangles
 
-    /// Hard cap on raw STL file size — bounds memory before any parsing decisions.
-    /// 2 GiB is well above any realistic 3D-print STL; pathological inputs are rejected up front.
-    public static let maxFileSize = 2 * 1024 * 1024 * 1024
+    /// Hard cap on raw STL file size for the CLI (Quick Look uses ``ResourceLimits/quickLook``).
+    public static let maxFileSize = ResourceLimits.cli.maxSTLFileBytes
 
-    public static func parseMesh(from fileURL: URL) throws -> MeshData {
-        let data = try Data(contentsOf: fileURL)
-        guard data.count <= maxFileSize else {
+    public static func parseMesh(
+        from fileURL: URL,
+        limits: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil
+    ) throws -> MeshData {
+        let data: Data
+        do {
+            data = try BoundedFileReader.dataContents(of: fileURL, maxByteCount: limits.maxSTLFileBytes)
+        } catch BoundedFileReader.ReadError.fileTooLarge {
             throw STLParserError.fileTooLarge
         }
+        return try parseMesh(data: data, limits: limits, cancellation: cancellation)
+    }
+
+    static func parseMesh(
+        data: Data,
+        limits: ResourceLimits,
+        cancellation: ParseCancellation? = nil
+    ) throws -> MeshData {
         guard data.count > 84 else {
-            return try parseASCII(data: data)
+            return try parseASCII(data: data, limits: limits, cancellation: cancellation)
         }
 
         // Standard STL detection: ASCII files begin with `solid `. The pure size-based
@@ -41,8 +54,16 @@ public enum STLParser {
         // emit binary files starting with `solid` (their 80-byte header just happens to);
         // those get a binary fallback when ASCII parsing produces no triangles.
         let startsWithSolid = data.starts(with: [0x73, 0x6F, 0x6C, 0x69, 0x64]) // "solid"
-        if startsWithSolid, let mesh = try? parseASCII(data: data) {
-            return mesh
+        if startsWithSolid {
+            do {
+                return try parseASCII(data: data, limits: limits, cancellation: cancellation)
+            } catch is CancellationError {
+                // Cancellation is not a parse failure — never fall through to the binary
+                // path, or a cancelled preview would start a second full parse.
+                throw CancellationError()
+            } catch {
+                // Genuine ASCII failure: fall through to binary detection below.
+            }
         }
 
         var triangleCount: UInt32 = 0
@@ -52,9 +73,14 @@ public enum STLParser {
         let expectedSize = 84 + Int(triangleCount) * 50
         // Accept files >= expectedSize to tolerate trailing bytes some slicers append.
         if triangleCount > 0, data.count >= expectedSize {
-            return try parseBinary(data: data, triangleCount: Int(triangleCount))
+            return try parseBinary(
+                data: data,
+                triangleCount: Int(triangleCount),
+                limits: limits,
+                cancellation: cancellation
+            )
         } else {
-            return try parseASCII(data: data)
+            return try parseASCII(data: data, limits: limits, cancellation: cancellation)
         }
     }
 
@@ -62,19 +88,39 @@ public enum STLParser {
     /// overhead (per-chunk allocations + final merge) dwarfs the gain.
     private static let parallelTriangleThreshold = 100_000
 
-    private static func parseBinary(data: Data, triangleCount: Int) throws -> MeshData {
+    private static func parseBinary(
+        data: Data,
+        triangleCount: Int,
+        limits: ResourceLimits,
+        cancellation: ParseCancellation?
+    ) throws -> MeshData {
         guard triangleCount > 0 else { throw STLParserError.noTriangles }
-        let clampedCount = min(triangleCount, maxTriangles)
+        let clampedCount = min(triangleCount, limits.maxSTLTriangles)
 
         if clampedCount >= parallelTriangleThreshold {
-            return try parseBinaryParallel(data: data, triangleCount: clampedCount)
+            return try parseBinaryParallel(
+                data: data,
+                triangleCount: clampedCount,
+                limits: limits,
+                cancellation: cancellation
+            )
         }
-        return try parseBinarySerial(data: data, triangleCount: clampedCount)
+        return try parseBinarySerial(
+            data: data,
+            triangleCount: clampedCount,
+            limits: limits,
+            cancellation: cancellation
+        )
     }
 
     /// Internal so tests can compare serial vs parallel paths on identical input.
     /// Not part of the public API — callers should use `parseMesh(from:)`.
-    static func parseBinarySerial(data: Data, triangleCount: Int) throws -> MeshData {
+    static func parseBinarySerial(
+        data: Data,
+        triangleCount: Int,
+        limits _: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil
+    ) throws -> MeshData {
         var vertices: [simd_float3] = []
         var indices: [UInt32] = []
         var vertexMap: [VertexKey: UInt32] = [:]
@@ -86,7 +132,9 @@ public enum STLParser {
 
         try data.withUnsafeBytes { raw in
             guard raw.baseAddress != nil else { throw STLParserError.cannotReadFile }
+            var poller = CancellationPoller(cancellation)
             for i in 0 ..< triangleCount {
+                try poller.tick()
                 let triOffset = 84 + i * 50 + 12 // skip header + normal
                 for v in 0 ..< 3 {
                     let vOffset = triOffset + v * 12
@@ -108,7 +156,7 @@ public enum STLParser {
         }
 
         var mesh = MeshData(vertices: vertices, indices: indices, normals: nil)
-        mesh.computeNormals()
+        try mesh.computeNormals(cancellation: cancellation)
         return mesh
     }
 
@@ -116,11 +164,21 @@ public enum STLParser {
     /// over a disjoint triangle range. A final serial merge re-keys local indices to a global
     /// dedup map. Speedup is ~2–3× on M-series for >1M-triangle files.
     /// Internal so tests can compare against `parseBinarySerial` on identical input.
-    static func parseBinaryParallel(data: Data, triangleCount: Int) throws -> MeshData {
+    static func parseBinaryParallel(
+        data: Data,
+        triangleCount: Int,
+        limits: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil
+    ) throws -> MeshData {
         let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
         let chunks = min(cores * 2, max(1, triangleCount / 50000))
         if chunks <= 1 {
-            return try parseBinarySerial(data: data, triangleCount: triangleCount)
+            return try parseBinarySerial(
+                data: data,
+                triangleCount: triangleCount,
+                limits: limits,
+                cancellation: cancellation
+            )
         }
 
         let results = (0 ..< chunks).map { _ in ChunkResult() }
@@ -141,7 +199,11 @@ public enum STLParser {
             result.localMap.reserveCapacity(triPerChunk)
 
             dataLocal.withUnsafeBytes { raw in
+                var poller = CancellationPoller(cancellation)
                 for i in start ..< end {
+                    if poller.tickIsCancelled() {
+                        return
+                    }
                     let triOffset = 84 + i * 50 + 12 // skip header + normal
                     for v in 0 ..< 3 {
                         let vOffset = triOffset + v * 12
@@ -162,6 +224,10 @@ public enum STLParser {
             }
         }
 
+        // A cancelled chunk returns with a truncated vertex list, so merging would yield a
+        // silently incomplete mesh. Bail before the merge instead.
+        try cancellation?.check()
+
         // Serial merge: walk each chunk's vertex list and remap local→global indices.
         // The merge is O(total_local_vertices) hash lookups — cheap relative to the
         // per-thread work just done.
@@ -172,9 +238,11 @@ public enum STLParser {
         globalIndices.reserveCapacity(triangleCount * 3)
         globalMap.reserveCapacity(triangleCount)
 
+        var mergePoller = CancellationPoller(cancellation)
         for chunk in results {
             var remap = [UInt32](repeating: 0, count: chunk.vertices.count)
             for (localIdx, vertex) in chunk.vertices.enumerated() {
+                try mergePoller.tick()
                 let key = VertexKey(x: vertex.x, y: vertex.y, z: vertex.z)
                 if let globalIdx = globalMap[key] {
                     remap[localIdx] = globalIdx
@@ -191,13 +259,17 @@ public enum STLParser {
         }
 
         var mesh = MeshData(vertices: globalVertices, indices: globalIndices, normals: nil)
-        mesh.computeNormals()
+        try mesh.computeNormals(cancellation: cancellation)
         return mesh
     }
 
     /// Byte-level ASCII STL parser — avoids `String(data:)` allocation on the whole file.
     /// Scans line-by-line for `vertex X Y Z` tokens, parses floats inline.
-    private static func parseASCII(data: Data) throws -> MeshData {
+    private static func parseASCII(
+        data: Data,
+        limits: ResourceLimits,
+        cancellation: ParseCancellation?
+    ) throws -> MeshData {
         var vertices: [simd_float3] = []
         var indices: [UInt32] = []
         var vertexMap: [VertexKey: UInt32] = [:]
@@ -208,8 +280,10 @@ public enum STLParser {
             }
             let count = raw.count
             var pos = 0
+            var poller = CancellationPoller(cancellation)
 
             while pos < count {
+                try poller.tick()
                 // Skip leading whitespace on the line.
                 while pos < count, base[pos] == 0x20 || base[pos] == 0x09 {
                     pos += 1
@@ -222,9 +296,9 @@ public enum STLParser {
                    base[pos + 6] == 0x20 || base[pos + 6] == 0x09
                 {
                     pos += 6 // past `vertex`
-                    let xRange = scanFloatToken(base: base, count: count, pos: &pos)
-                    let yRange = scanFloatToken(base: base, count: count, pos: &pos)
-                    let zRange = scanFloatToken(base: base, count: count, pos: &pos)
+                    let xRange = try scanFloatToken(base: base, count: count, pos: &pos, poller: &poller)
+                    let yRange = try scanFloatToken(base: base, count: count, pos: &pos, poller: &poller)
+                    let zRange = try scanFloatToken(base: base, count: count, pos: &pos, poller: &poller)
                     if let xRange, let yRange, let zRange {
                         let x = parseFloatBytes(base: base, range: xRange)
                         let y = parseFloatBytes(base: base, range: yRange)
@@ -239,13 +313,14 @@ public enum STLParser {
                             indices.append(idx)
                         }
                         // Bound aggregate triangle count under aggressive crafted input.
-                        if indices.count >= maxTriangles * 3 {
+                        if indices.count >= limits.maxSTLTriangles * 3 {
                             break
                         }
                     }
                 }
                 // Advance to next newline.
                 while pos < count, base[pos] != 0x0A {
+                    try poller.tick()
                     pos += 1
                 }
                 if pos < count {
@@ -257,7 +332,7 @@ public enum STLParser {
         guard indices.count >= 3 else { throw STLParserError.noTriangles }
 
         var mesh = MeshData(vertices: vertices, indices: indices, normals: nil)
-        mesh.computeNormals()
+        try mesh.computeNormals(cancellation: cancellation)
         return mesh
     }
 
@@ -267,18 +342,26 @@ public enum STLParser {
     private static func scanFloatToken(
         base: UnsafePointer<UInt8>,
         count: Int,
-        pos: inout Int
-    ) -> Range<Int>? {
+        pos: inout Int,
+        poller: inout CancellationPoller
+    ) throws -> Range<Int>? {
         while pos < count, base[pos] == 0x20 || base[pos] == 0x09 {
+            try poller.tick()
             pos += 1
         }
         let start = pos
         while pos < count {
+            try poller.tick()
             let c = base[pos]
             if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
                 break
             }
             pos += 1
+            // No valid STL coordinate needs an unbounded token. Stop retaining/scanning
+            // absurd input while preserving the outer line scan's cancellation checks.
+            if pos - start >= 256 {
+                break
+            }
         }
         return start < pos ? start ..< pos : nil
     }

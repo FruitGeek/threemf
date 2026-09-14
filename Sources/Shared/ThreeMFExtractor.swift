@@ -63,7 +63,7 @@ public enum ThreeMFExtractor {
                     }
                 }
                 if !data.isEmpty {
-                    return data
+                    return try validatedPNG(data)
                 }
             }
         }
@@ -91,12 +91,23 @@ public enum ThreeMFExtractor {
                     }
                 }
                 if !data.isEmpty {
-                    return data
+                    return try validatedPNG(data)
                 }
             }
         }
 
         throw ThreeMFExtractorError.noThumbnailFound
+    }
+
+    private static func validatedPNG(_ data: Data) throws -> Data {
+        do {
+            try SafePNGValidator.validatePNGData(data)
+        } catch SafePNGValidator.ValidationError.dimensionsTooLarge {
+            throw ThreeMFExtractorError.thumbnailTooLarge
+        } catch {
+            throw ThreeMFExtractorError.noThumbnailFound
+        }
+        return data
     }
 
     /// Reference to a plate thumbnail inside a 3MF archive — path + index only, no data.
@@ -180,8 +191,9 @@ public enum ThreeMFExtractor {
             }
         }
         guard !data.isEmpty else { return nil }
-        ThumbnailCache.store(data, for: fileURL, extraKey: plate.path)
-        return data
+        let safe = try validatedPNG(data)
+        ThumbnailCache.store(safe, for: fileURL, extraKey: plate.path)
+        return safe
     }
 
     /// Extracts and parses Bambu/Orca per-plate JSON metadata (`Metadata/plate_<N>.json`).

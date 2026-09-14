@@ -276,13 +276,11 @@ class ThreeMFMeshParserTests: XCTestCase {
     // MARK: - Thumbnail Extraction
 
     func testExtractThumbnail_withPNG() throws {
-        // Create a 3MF with a fake PNG thumbnail
-        let pngHeader = Data([0x89, 0x50, 0x4E, 0x47]) // PNG magic bytes
-        let url = try make3MFFile(modelXML: "<model/>", thumbnailData: pngHeader)
+        let url = try make3MFFile(modelXML: "<model/>", thumbnailData: TestPNG.tiny1x1)
         defer { try? FileManager.default.removeItem(at: url) }
 
         let data = try ThreeMFExtractor.extractThumbnail(from: url)
-        XCTAssertEqual(data.prefix(4), pngHeader)
+        XCTAssertEqual(data, TestPNG.tiny1x1)
     }
 
     func testExtractThumbnail_noThumbnail_throws() throws {
@@ -301,7 +299,7 @@ class ThreeMFMeshParserTests: XCTestCase {
 
     // MARK: - SceneBuilder
 
-    func testBuildScene_producesValidScene() {
+    func testBuildScene_producesValidScene() throws {
         var mesh = MeshData(
             vertices: [
                 simd_float3(0, 0, 0),
@@ -311,7 +309,7 @@ class ThreeMFMeshParserTests: XCTestCase {
             indices: [0, 1, 2],
             normals: nil
         )
-        mesh.computeNormals()
+        try mesh.computeNormals()
 
         let scene = SceneBuilder.buildScene(from: mesh)
 
@@ -446,6 +444,70 @@ class ThreeMFMeshParserTests: XCTestCase {
                 error is ThreeMFMeshParserError || error is NSError,
                 "Unexpected error type: \(error)"
             )
+        }
+    }
+
+    func testParseMesh_modelEntriesShareAggregateExtractionBudget() throws {
+        let componentXML = """
+        <model><resources><object id="2" type="model"><mesh><vertices>
+        <vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>
+        </vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources></model>
+        """
+        let rootXML = """
+        <model xmlns:p="production"><resources><object id="1" type="model"><components>
+        <component p:path="/3D/Objects/object_1.model" objectid="2"/>
+        </components></object></resources><build><item objectid="1"/></build></model>
+        """
+        let rootData = Data(rootXML.utf8)
+        let componentData = Data(componentXML.utf8)
+        let url = try make3MFFile(entries: [
+            (path: "3D/3dmodel.model", content: rootData),
+            (path: "3D/Objects/object_1.model", content: componentData),
+        ])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var limits = ResourceLimits.quickLook
+        limits.maxModelExtractBytes = UInt64(rootData.count + componentData.count - 1)
+
+        XCTAssertThrowsError(try ThreeMFMeshParser.parseMesh(from: url, limits: limits)) { error in
+            XCTAssertEqual(error as? ThreeMFMeshParserError, .sizeLimitExceeded)
+        }
+    }
+
+    func testParseMesh_scannerHonorsVertexLimit() throws {
+        let modelXML = """
+        <model><resources><object id="1" type="model"><mesh><vertices>
+        <vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>
+        </vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>
+        </resources><build><item objectid="1"/></build></model>
+        """
+        let url = try make3MFFile(modelXML: modelXML)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var limits = ResourceLimits.quickLook
+        limits.maxVertices = 2
+
+        XCTAssertThrowsError(try ThreeMFMeshParser.parseMesh(from: url, limits: limits)) { error in
+            XCTAssertEqual(error as? ThreeMFMeshParserError, .noMeshData)
+        }
+    }
+
+    func testParseMesh_preCancelledThrows() throws {
+        let modelXML = """
+        <model><resources><object id="1" type="model"><mesh><vertices>
+        <vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>
+        </vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>
+        </resources><build><item objectid="1"/></build></model>
+        """
+        let url = try make3MFFile(modelXML: modelXML)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cancellation = ParseCancellation()
+        cancellation.cancel()
+
+        XCTAssertThrowsError(
+            try ThreeMFMeshParser.parseMesh(from: url, cancellation: cancellation)
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
         }
     }
 
@@ -718,16 +780,7 @@ class ThreeMFMeshParserTests: XCTestCase {
     // MARK: - Multi-plate enumeration (P1.4)
 
     func testListPlates_multiplePlates_returnsAllInOrder() throws {
-        // 1×1 PNG bytes — minimal valid PNG to satisfy archive read.
-        let pngHeader: [UInt8] = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x00, 0x00, 0x00, 0x00, 0x3B, 0x7E, 0x9B,
-            0x55, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-            0x44, 0xAE, 0x42, 0x60, 0x82,
-        ]
-        let png = Data(pngHeader)
+        let png = TestPNG.tiny1x1
         let url = try make3MFFile(entries: [
             (path: "3D/3dmodel.model", content: XCTUnwrap("<model/>".data(using: .utf8))),
             (path: "Metadata/plate_2.png", content: png),

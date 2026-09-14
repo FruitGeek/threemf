@@ -232,7 +232,10 @@ public struct MeshData {
 
     /// Computes per-vertex normals by accumulating face normals.
     /// Parallelizes across CPU cores using per-thread scratch buffers and a final reduce.
-    public mutating func computeNormals(progress: ((Float) -> Void)? = nil) {
+    public mutating func computeNormals(
+        progress: ((Float) -> Void)? = nil,
+        cancellation: ParseCancellation? = nil
+    ) throws {
         let count = vertices.count
         let totalTriangles = indices.count / 3
         guard count > 0, totalTriangles > 0 else {
@@ -243,7 +246,7 @@ public struct MeshData {
 
         // Single-threaded path for small meshes — parallel overhead isn't worth it.
         if totalTriangles < 50000 {
-            normals = computeNormalsSerial(progress: progress)
+            normals = try computeNormalsSerial(progress: progress, cancellation: cancellation)
             return
         }
 
@@ -255,6 +258,8 @@ public struct MeshData {
         let verticesLocal = vertices
         let indicesLocal = indices
         nonisolated(unsafe) let progressLocal = progress
+
+        try cancellation?.check()
 
         // Per-chunk scratch as a flat raw allocation. Each chunk writes to a disjoint
         // [chunkIdx * count, (chunkIdx + 1) * count) range, so the captured base
@@ -277,7 +282,11 @@ public struct MeshData {
             let local = flatBase.advanced(by: chunkIdx * count)
             verticesLocal.withUnsafeBufferPointer { vPtr in
                 indicesLocal.withUnsafeBufferPointer { iPtr in
+                    var poller = CancellationPoller(cancellation)
                     for t in start ..< end {
+                        if poller.tickIsCancelled() {
+                            return
+                        }
                         let i0 = Int(iPtr[t * 3])
                         let i1 = Int(iPtr[t * 3 + 1])
                         let i2 = Int(iPtr[t * 3 + 2])
@@ -304,9 +313,14 @@ public struct MeshData {
             }
         }
 
+        // Chunks that noticed cancellation returned with partial sums, so the reduce below
+        // would produce wrong normals. Bail before it runs.
+        try cancellation?.check()
+
         // Reduce: sum each chunk's partial buffer into a single accumulator.
         var accum = [simd_float3](repeating: .zero, count: count)
         for chunkIdx in 0 ..< chunks {
+            try cancellation?.check()
             let base = flatBase.advanced(by: chunkIdx * count)
             for i in 0 ..< count {
                 accum[i] += base[i]
@@ -321,14 +335,19 @@ public struct MeshData {
         progress?(1.0)
     }
 
-    private func computeNormalsSerial(progress: ((Float) -> Void)?) -> [simd_float3] {
+    private func computeNormalsSerial(
+        progress: ((Float) -> Void)?,
+        cancellation: ParseCancellation?
+    ) throws -> [simd_float3] {
         let count = vertices.count
         var accum = [simd_float3](repeating: .zero, count: count)
 
         let totalTriangles = indices.count / 3
         let reportInterval = max(totalTriangles / 20, 1)
+        var poller = CancellationPoller(cancellation)
 
         for t in 0 ..< totalTriangles {
+            try poller.tick()
             let i0 = Int(indices[t * 3])
             let i1 = Int(indices[t * 3 + 1])
             let i2 = Int(indices[t * 3 + 2])

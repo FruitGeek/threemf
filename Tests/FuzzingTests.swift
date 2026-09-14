@@ -31,6 +31,17 @@ struct FuzzingTests {
         }
     }
 
+    @Test("G-code parser never crashes on random bytes")
+    func fuzzGCodeRandomBytes() throws {
+        var rng = SeededRNG(seed: 0xF00D)
+        for _ in 0 ..< iterations {
+            let bytes = randomBytes(length: rng.uniform(in: 0 ... 8192), rng: &rng)
+            let url = try writeTempFile(bytes: bytes, ext: "gcode")
+            defer { try? FileManager.default.removeItem(at: url) }
+            _ = try? GCodeParser.parse(from: url)
+        }
+    }
+
     @Test("3MF parser never crashes on random bytes")
     func fuzz3MFRandomBytes() throws {
         // Random byte sequences mostly fail at the ZIP layer; this exercises that path.

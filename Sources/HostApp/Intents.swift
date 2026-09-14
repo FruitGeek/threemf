@@ -25,7 +25,7 @@ struct ShowThreeMFInfo: AppIntent {
         let summary: String
         switch ext {
         case "gcode":
-            let toolpath = try GCodeParser.parse(from: url)
+            let toolpath = try GCodeParser.parse(from: url, limits: .quickLook)
             let dims = toolpath.boundingBox.dimensions
             let etaSec = Int(toolpath.estimatedSeconds.rounded())
             summary = String(
@@ -38,8 +38,8 @@ struct ShowThreeMFInfo: AppIntent {
             )
         case "stl", "3mf":
             let mesh: MeshData = ext == "stl"
-                ? try STLParser.parseMesh(from: url)
-                : try ThreeMFMeshParser.parseMesh(from: url)
+                ? try STLParser.parseMesh(from: url, limits: .quickLook)
+                : try ThreeMFMeshParser.parseMesh(from: url, limits: .quickLook)
             let stats = mesh.statistics()
             let dims = stats.boundingBox.dimensions
             var s = String(
@@ -86,9 +86,9 @@ struct RenderThreeMFThumbnail: AppIntent {
         let mesh: MeshData
         switch ext {
         case "stl":
-            mesh = try STLParser.parseMesh(from: url)
+            mesh = try STLParser.parseMesh(from: url, limits: .quickLook)
         case "3mf":
-            mesh = try ThreeMFMeshParser.parseMesh(from: url)
+            mesh = try ThreeMFMeshParser.parseMesh(from: url, limits: .quickLook)
         default:
             throw $file.needsValueError("Expected a .3mf or .stl file")
         }

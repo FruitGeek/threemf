@@ -23,7 +23,7 @@ class ThumbnailProvider: QLThumbnailProvider {
         // Cache check — both .3mf and .stl write a PNG to the cache after rendering,
         // so a hit here saves the entire parse+render path on the second preview.
         if let cached = ThumbnailCache.cachedThumbnail(for: request.fileURL),
-           let image = NSImage(data: cached)
+           let image = SafePNGValidator.nsImage(fromPNG: cached)
         {
             renderImageThumbnail(image: image, request: request, handler: handler)
             return
@@ -56,7 +56,7 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
 
         do {
-            let toolpath = try GCodeParser.parse(from: request.fileURL)
+            let toolpath = try GCodeParser.parse(from: request.fileURL, limits: .quickLook)
             let scene = ToolpathSceneBuilder.buildTopDownScene(from: toolpath)
             let maxSize = request.maximumSize
             let size = CGSize(width: min(maxSize.width, 512), height: min(maxSize.height, 512))
@@ -88,7 +88,7 @@ class ThumbnailProvider: QLThumbnailProvider {
     ) {
         // Try embedded PNG first (fast).
         if let imageData = try? ThreeMFExtractor.extractThumbnail(from: request.fileURL),
-           let image = NSImage(data: imageData)
+           let image = SafePNGValidator.nsImage(fromPNG: imageData)
         {
             // Cache the raw PNG so subsequent previews skip the ZIP walk.
             ThumbnailCache.store(imageData, for: request.fileURL)
@@ -106,7 +106,7 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
 
         do {
-            let mesh = try ThreeMFMeshParser.parseMesh(from: request.fileURL)
+            let mesh = try ThreeMFMeshParser.parseMesh(from: request.fileURL, limits: .quickLook)
             renderSceneThumbnail(mesh: mesh, request: request, handler: handler)
         } catch {
             log.error("3MF thumbnail mesh parse failed: \(error.localizedDescription, privacy: .public)")
@@ -126,7 +126,7 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
 
         do {
-            let mesh = try STLParser.parseMesh(from: request.fileURL)
+            let mesh = try STLParser.parseMesh(from: request.fileURL, limits: .quickLook)
             renderSceneThumbnail(mesh: mesh, request: request, handler: handler)
         } catch {
             log.error("STL thumbnail parse failed: \(error.localizedDescription, privacy: .public)")

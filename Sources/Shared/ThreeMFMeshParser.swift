@@ -27,19 +27,33 @@ public enum ThreeMFMeshParserError: Error, LocalizedError {
 private let log = Logger(subsystem: "com.andreymaltsev.3mf-quicklook", category: "ThreeMFMeshParser")
 
 public enum ThreeMFMeshParser {
-    /// Maximum allowed size for any single extracted model entry (500 MB).
-    /// Both the declared central-directory size *and* the running streamed total are capped.
-    private static let maxModelSize: UInt64 = 500 * 1024 * 1024
-
-    /// Aggregate caps applied across the whole 3MF (sum of all components).
-    public static let maxVertices: Int = 50_000_000
-    public static let maxTriangles: Int = 100_000_000
+    /// Aggregate caps for the headless CLI (Quick Look uses ``ResourceLimits/quickLook``).
+    public static let maxVertices: Int = ResourceLimits.cli.maxVertices
+    public static let maxTriangles: Int = ResourceLimits.cli.maxTriangles
 
     private static let modelPaths = [
         "3D/3dmodel.model",
         "3D/3DModel.model",
         "3d/3dmodel.model",
     ]
+
+    /// Shared across every `.model` extraction in one parse so a component-heavy archive
+    /// cannot multiply the per-entry cap by its number of entries.
+    private final class ExtractionBudget {
+        private(set) var remaining: UInt64
+
+        init(_ total: UInt64) {
+            remaining = total
+        }
+
+        func consume(_ byteCount: Int) throws {
+            let count = UInt64(byteCount)
+            guard count <= remaining else {
+                throw ThreeMFMeshParserError.sizeLimitExceeded
+            }
+            remaining -= count
+        }
+    }
 
     /// Validate a component-relative path inside the archive. Rejects traversal
     /// attempts and non-`.model` entries to harden against crafted archives.
@@ -60,19 +74,26 @@ public enum ThreeMFMeshParser {
         _ archive: Archive,
         entry: Entry,
         cap: UInt64,
+        budget: ExtractionBudget? = nil,
+        cancellation: ParseCancellation? = nil,
         progress: ((Float) -> Void)? = nil
     ) throws -> Data {
-        guard entry.uncompressedSize <= cap else {
+        guard entry.uncompressedSize <= cap,
+              entry.uncompressedSize <= (budget?.remaining ?? cap)
+        else {
             throw ThreeMFMeshParserError.sizeLimitExceeded
         }
         let totalSize = max(entry.uncompressedSize, 1)
         var data = Data()
         data.reserveCapacity(Int(totalSize))
         _ = try archive.extract(entry) { chunk in
+            // Chunks are large enough that polling every one is free.
+            try cancellation?.check()
             // Defense against ZIP bombs: enforce the cap on the *actual* stream too.
             if UInt64(data.count) + UInt64(chunk.count) > cap {
                 throw ThreeMFMeshParserError.sizeLimitExceeded
             }
+            try budget?.consume(chunk.count)
             data.append(chunk)
             progress?(Float(data.count) / Float(totalSize))
         }
@@ -81,9 +102,13 @@ public enum ThreeMFMeshParser {
 
     /// Reads an archive entry into memory if it exists, returning nil when absent or
     /// unreadable. Used for the small Bambu/Orca `Metadata/*.config` side files.
-    private static func readEntryIfPresent(_ archive: Archive, path: String) -> Data? {
+    private static func readEntryIfPresent(
+        _ archive: Archive,
+        path: String,
+        limits: ResourceLimits
+    ) -> Data? {
         guard let entry = archive[path] else { return nil }
-        return try? extractCapped(archive, entry: entry, cap: maxModelSize)
+        return try? extractCapped(archive, entry: entry, cap: limits.maxMetadataSidecarBytes)
     }
 
     /// Fast path that extracts only `<metadata>` tags from the root model file.
@@ -92,14 +117,23 @@ public enum ThreeMFMeshParser {
     /// **Throws** when the archive can't be opened (vs returning nil); **returns nil**
     /// when the archive opens cleanly but has no `<metadata>` tags. Lets callers
     /// distinguish "file is broken" from "file simply has no metadata."
-    public static func parseMetadata(from fileURL: URL) throws -> ThreeMFMetadata? {
+    public static func parseMetadata(
+        from fileURL: URL,
+        limits: ResourceLimits = .cli
+    ) throws -> ThreeMFMetadata? {
         let archive = try Archive(url: fileURL, accessMode: .read)
+        let budget = ExtractionBudget(limits.maxModelExtractBytes)
         for path in modelPaths {
             guard let entry = archive[path] else { continue }
-            guard let data = try? extractCapped(archive, entry: entry, cap: maxModelSize) else {
+            guard let data = try? extractCapped(
+                archive,
+                entry: entry,
+                cap: limits.maxModelExtractBytes,
+                budget: budget
+            ) else {
                 continue
             }
-            let result = FastMeshScanner.scan(data)
+            let result = FastMeshScanner.scan(data, limits: limits)
             return result.metadata.isEmpty ? nil : result.metadata
         }
         return nil
@@ -107,7 +141,12 @@ public enum ThreeMFMeshParser {
 
     /// Progress callback: receives a value from 0.0 to 1.0
     /// Phases: 0–0.4 = ZIP extraction, 0.4–0.8 = XML scanning, 0.8–1.0 = normal computation
-    public static func parseMesh(from fileURL: URL, progress: ((Float) -> Void)? = nil) throws -> MeshData {
+    public static func parseMesh(
+        from fileURL: URL,
+        limits: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil,
+        progress: ((Float) -> Void)? = nil
+    ) throws -> MeshData {
         let archive: Archive
         do {
             archive = try Archive(url: fileURL, accessMode: .read)
@@ -115,10 +154,17 @@ public enum ThreeMFMeshParser {
             throw ThreeMFMeshParserError.cannotOpenArchive
         }
 
+        let extractionBudget = ExtractionBudget(limits.maxModelExtractBytes)
         var modelData: Data?
         for path in modelPaths {
             if let entry = archive[path] {
-                let data = try extractCapped(archive, entry: entry, cap: maxModelSize)
+                let data = try extractCapped(
+                    archive,
+                    entry: entry,
+                    cap: limits.maxModelExtractBytes,
+                    budget: extractionBudget,
+                    cancellation: cancellation
+                )
                 if !data.isEmpty {
                     modelData = data
                     break
@@ -131,13 +177,22 @@ public enum ThreeMFMeshParser {
         }
 
         // Fast-path: scan bytes directly for vertex/triangle data
-        let result = FastMeshScanner.scan(xmlData)
+        let result = FastMeshScanner.scan(xmlData, limits: limits, cancellation: cancellation)
+        try cancellation?.check()
+        var remainingScanVertices = max(
+            0,
+            limits.maxVertices - result.objectMeshes.values.reduce(0) { $0 + $1.vertices.count }
+        )
+        var remainingScanTriangles = max(
+            0,
+            limits.maxTriangles - result.objectMeshes.values.reduce(0) { $0 + ($1.indices.count / 3) }
+        )
 
         // Defensive fallback: if the byte-level scanner returned nothing (unusual
         // namespace, CDATA-wrapped mesh, structurally exotic 3MF), try NSXMLParser
         // on the root model file as a one-shot recovery.
         if result.objectMeshes.isEmpty, result.components.isEmpty, result.buildItems.isEmpty {
-            if let fallback = nsxmlFallback(xmlData: xmlData) {
+            if let fallback = nsxmlFallback(xmlData: xmlData, limits: limits) {
                 log.notice("FastMeshScanner returned empty; using NSXMLParser fallback")
                 progress?(0.8)
                 var mesh = MeshData(
@@ -146,7 +201,10 @@ public enum ThreeMFMeshParser {
                     normals: nil,
                     metadata: result.metadata.isEmpty ? nil : result.metadata
                 )
-                mesh.computeNormals { fraction in progress?(0.8 + 0.2 * fraction) }
+                try mesh.computeNormals(
+                    progress: { fraction in progress?(0.8 + 0.2 * fraction) },
+                    cancellation: cancellation
+                )
                 return mesh
             }
         }
@@ -176,6 +234,7 @@ public enum ThreeMFMeshParser {
 
         // External component meshes — only extract those actually needed
         for comp in result.components {
+            try cancellation?.check()
             guard neededObjectIds.contains(comp.objectId) || neededObjectIds.contains(comp.parentObjectId) else {
                 continue
             }
@@ -190,10 +249,24 @@ public enum ThreeMFMeshParser {
             if let entry = archive[normalized] {
                 let data: Data
                 do {
-                    data = try extractCapped(archive, entry: entry, cap: maxModelSize) { fraction in
+                    data = try extractCapped(
+                        archive,
+                        entry: entry,
+                        cap: limits.maxModelExtractBytes,
+                        budget: extractionBudget,
+                        cancellation: cancellation
+                    ) { fraction in
                         // 0–40%: ZIP extraction progress
                         progress?(0.4 * fraction)
                     }
+                } catch is CancellationError {
+                    // A cancelled extract must abort the whole parse, not skip one component
+                    // and keep extracting the rest.
+                    throw CancellationError()
+                } catch ThreeMFMeshParserError.sizeLimitExceeded {
+                    // The budget is shared across components; exhausting it must terminate
+                    // the parse rather than turning the limit into a best-effort skip.
+                    throw ThreeMFMeshParserError.sizeLimitExceeded
                 } catch {
                     log
                         .error(
@@ -203,12 +276,25 @@ public enum ThreeMFMeshParser {
                 }
                 if !data.isEmpty {
                     progress?(0.4)
-                    let compResult = FastMeshScanner.scan(data) { scanFraction in
+                    var componentLimits = limits
+                    componentLimits.maxVertices = remainingScanVertices
+                    componentLimits.maxTriangles = remainingScanTriangles
+                    let compResult = FastMeshScanner.scan(
+                        data,
+                        limits: componentLimits,
+                        cancellation: cancellation
+                    ) { scanFraction in
                         // 40–80%: scanning progress
                         progress?(0.4 + 0.4 * scanFraction)
                     }
+                    try cancellation?.check()
                     if let firstMesh = compResult.objectMeshes.first {
                         objectMeshes[comp.objectId] = firstMesh.value
+                        remainingScanVertices = max(0, remainingScanVertices - firstMesh.value.vertices.count)
+                        remainingScanTriangles = max(
+                            0,
+                            remainingScanTriangles - (firstMesh.value.indices.count / 3)
+                        )
                         // Carry the component's paint states under the referencing object id.
                         if let paint = compResult.objectPaintStates[firstMesh.key] {
                             objectPaintStates[comp.objectId] = paint
@@ -221,8 +307,8 @@ public enum ThreeMFMeshParser {
         // Bambu/Orca color + plate layout lives outside the model XML, in the Metadata
         // config files. Tolerant: absent or malformed → empty config, no effect.
         let bambuConfig = BambuModelConfig.parse(
-            modelSettings: readEntryIfPresent(archive, path: "Metadata/model_settings.config"),
-            projectSettings: readEntryIfPresent(archive, path: "Metadata/project_settings.config")
+            modelSettings: readEntryIfPresent(archive, path: "Metadata/model_settings.config", limits: limits),
+            projectSettings: readEntryIfPresent(archive, path: "Metadata/project_settings.config", limits: limits)
         )
         let bambuColor = bambuConfig.hasColorAssignment
         let bambuHasPlates = !bambuConfig.objectPlateIndex.isEmpty
@@ -243,8 +329,8 @@ public enum ThreeMFMeshParser {
 
         /// Aggregate caps to bound memory.
         func canAppend(verts: Int, tris: Int) -> Bool {
-            allVertices.count + verts <= maxVertices
-                && (allIndices.count / 3) + tris <= maxTriangles
+            allVertices.count + verts <= limits.maxVertices
+                && (allIndices.count / 3) + tris <= limits.maxTriangles
         }
 
         if !result.buildItems.isEmpty {
@@ -262,6 +348,7 @@ public enum ThreeMFMeshParser {
                     visiting: []
                 )
                 for emission in emissions {
+                    try cancellation?.check()
                     guard let mesh = objectMeshes[emission.meshObjectId] else { continue }
                     guard canAppend(verts: mesh.vertices.count, tris: mesh.indices.count / 3) else {
                         log
@@ -342,6 +429,7 @@ public enum ThreeMFMeshParser {
         } else {
             // Sort for deterministic display order across launches.
             for objId in objectMeshes.keys.sorted() {
+                try cancellation?.check()
                 guard let mesh = objectMeshes[objId] else { continue }
                 guard canAppend(verts: mesh.vertices.count, tris: mesh.indices.count / 3) else { continue }
                 let baseOffset = UInt32(allVertices.count)
@@ -382,7 +470,9 @@ public enum ThreeMFMeshParser {
         var filteredPlates: [Int] = []
         filteredPlates.reserveCapacity(allTrianglePlates.count)
         var t = 0
+        var filterPoller = CancellationPoller(cancellation)
         while t * 3 + 2 < allIndices.count {
+            try filterPoller.tick()
             let a = allIndices[t * 3], b = allIndices[t * 3 + 1], c = allIndices[t * 3 + 2]
             if a < vCount, b < vCount, c < vCount {
                 filteredIndices.append(a)
@@ -409,18 +499,27 @@ public enum ThreeMFMeshParser {
         mesh.trianglePlates = filteredPlates
         mesh.plates = bambuConfig.plates.map { PlateInfo(id: $0.id, name: $0.name) }
         mesh.metadata = result.metadata.isEmpty ? nil : result.metadata
-        mesh.computeNormals { normalFraction in
-            // 80–100%: normal computation progress
-            progress?(0.8 + 0.2 * normalFraction)
-        }
+        try mesh.computeNormals(
+            progress: { normalFraction in
+                // 80–100%: normal computation progress
+                progress?(0.8 + 0.2 * normalFraction)
+            },
+            cancellation: cancellation
+        )
         return mesh
     }
 
     /// Runs `XMLParser` (NSXMLParser) over the root model file to recover vertices and
     /// triangles when the byte-level fast scanner returned empty. Bounded by the same
     /// `maxVertices` / `maxTriangles` aggregate caps. Returns nil if it can't recover anything.
-    private static func nsxmlFallback(xmlData: Data) -> (vertices: [simd_float3], indices: [UInt32])? {
-        let delegate = NSXMLFallbackDelegate(maxVertices: maxVertices, maxTriangles: maxTriangles)
+    private static func nsxmlFallback(
+        xmlData: Data,
+        limits: ResourceLimits
+    ) -> (vertices: [simd_float3], indices: [UInt32])? {
+        let delegate = NSXMLFallbackDelegate(
+            maxVertices: limits.maxVertices,
+            maxTriangles: limits.maxTriangles
+        )
         let parser = XMLParser(data: xmlData)
         parser.delegate = delegate
         parser.shouldProcessNamespaces = false
@@ -614,7 +713,14 @@ enum FastMeshScanner {
         var objectPaintStates: [String: [Int]]
     }
 
-    static func scan(_ data: Data, progress: ((Float) -> Void)? = nil) -> ScanResult {
+    /// Returns whatever it assembled before cancellation, so callers must re-check the
+    /// token before trusting the result.
+    static func scan(
+        _ data: Data,
+        limits: ResourceLimits,
+        cancellation: ParseCancellation? = nil,
+        progress: ((Float) -> Void)? = nil
+    ) -> ScanResult {
         data.withUnsafeBytes { rawBuffer -> ScanResult in
             guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return ScanResult(
@@ -627,8 +733,8 @@ enum FastMeshScanner {
                 )
             }
             let count = rawBuffer.count
-            var scanner = ByteScanner(base: base, count: count)
-            return scanner.scan(progress: progress)
+            var scanner = ByteScanner(base: base, count: count, limits: limits)
+            return scanner.scan(cancellation: cancellation, progress: progress)
         }
     }
 }
@@ -636,7 +742,10 @@ enum FastMeshScanner {
 private struct ByteScanner {
     let base: UnsafePointer<UInt8>
     let count: Int
+    let limits: ResourceLimits
     var pos: Int = 0
+    private var totalVertices = 0
+    private var totalTriangles = 0
 
     // Current parsing state
     var objectMeshes: [String: ObjectMesh] = [:]
@@ -667,9 +776,10 @@ private struct ByteScanner {
     private var currentPaintStates: [Int] = []
     private var hasAnyPaint = false
 
-    init(base: UnsafePointer<UInt8>, count: Int) {
+    init(base: UnsafePointer<UInt8>, count: Int, limits: ResourceLimits) {
         self.base = base
         self.count = count
+        self.limits = limits
     }
 
     // ASCII constants
@@ -684,10 +794,13 @@ private struct ByteScanner {
     private static let quote: UInt8 = 0x22 // "
     private static let sQuote: UInt8 = 0x27 // '
 
-    mutating func scan(progress: ((Float) -> Void)? = nil) -> FastMeshScanner.ScanResult {
+    mutating func scan(
+        cancellation: ParseCancellation? = nil,
+        progress: ((Float) -> Void)? = nil
+    ) -> FastMeshScanner.ScanResult {
         // Pre-estimate capacity: ~60 bytes per vertex line, ~65 bytes per triangle line
         // A typical mesh is roughly 50% vertices + 50% triangles by byte count
-        let estimatedVertices = count / 120
+        let estimatedVertices = min(count / 120, limits.maxVertices)
         if estimatedVertices > 1000 {
             currentVertices.reserveCapacity(estimatedVertices)
             currentIndices.reserveCapacity(estimatedVertices * 3)
@@ -695,8 +808,15 @@ private struct ByteScanner {
 
         let reportInterval = max(count / 40, 1) // report ~40 times
         var nextReport = reportInterval
+        var poller = CancellationPoller(cancellation)
 
         while pos < count {
+            // Cancellation abandons the scan with partial results; `parseMesh` re-checks
+            // the token and throws rather than rendering a half-read mesh.
+            if poller.tickIsCancelled() {
+                break
+            }
+
             // Report scanning progress periodically
             if let progress, pos >= nextReport {
                 progress(Float(pos) / Float(count))
@@ -908,8 +1028,9 @@ private struct ByteScanner {
         }
         skipToTagEnd()
 
-        if gotX, gotY, gotZ {
+        if gotX, gotY, gotZ, totalVertices < limits.maxVertices {
             currentVertices.append(simd_float3(x, y, z))
+            totalVertices += 1
         }
     }
 
@@ -977,10 +1098,11 @@ private struct ByteScanner {
         }
         skipToTagEnd()
 
-        if gotV1, gotV2, gotV3 {
+        if gotV1, gotV2, gotV3, totalTriangles < limits.maxTriangles {
             currentIndices.append(v1)
             currentIndices.append(v2)
             currentIndices.append(v3)
+            totalTriangles += 1
             // Resolve material: pid identifies a basematerials group, p1 is the entry within it.
             // A triangle without its own pid/p1 inherits the object's default (pid/pindex),
             // per 3MF core spec — the common shape for single-color objects.

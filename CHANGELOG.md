@@ -4,6 +4,18 @@ All notable changes to threemf are documented here. Format: Keep a Changelog. Ve
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-09-14
+
+### Security
+- **STL/G-code size caps enforced before read**: `BoundedFileReader` checks on-disk `fileSize` before `Data(contentsOf:options: .mappedIfSafe)`, so oversize files fail without loading multi-gigabyte payloads into Quick Look or Spotlight workers.
+- **Spotlight large-file fast path for G-code and STL**: files over 50 MB get a lightweight description during indexing (same threshold as large 3MF metadata-only path), avoiding full toolpath/mesh parses in `mdworker`. A failed file-size lookup now fails closed instead of selecting the full parser.
+- **`ResourceLimits` profiles**: Quick Look / Spotlight extensions use tighter parse caps than `threemf-cli`; Bambu `Metadata/*.config` sidecars are capped separately, and all extracted `.model` entries share one aggregate budget so component-heavy archives cannot multiply the per-entry cap.
+- **PNG pixel-bomb guard**: embedded thumbnails are validated with ImageIO (`8192` max edge, `16 MP` max area) before `NSImage` decode. Dimension multiply uses overflow reporting so a crafted IHDR cannot trap.
+- **Preview parses are cancelled, not just ignored**: dismissing or switching a Quick Look preview cancels the in-flight parse through `ParseCancellation`. STL (serial, parallel, ASCII), G-code, 3MF extraction/scanning/assembly, and normal computation all poll the token at loop boundaries and abort with `CancellationError`, so a dismissed preview stops consuming CPU instead of running to completion.
+- **Preview load generation**: background mesh/toolpath parses no longer update the UI after Quick Look dismisses or switches files. The Quick Look completion handler still runs exactly once. App Intents use the Quick Look cap profile.
+- **G-code fuzzing**: `FuzzingTests` now covers random `.gcode` bytes alongside STL/3MF.
+- **Cancellation tests**: parser tests cover pre-cancelled STL, G-code, 3MF, and normal-computation paths plus a mid-flight cancel of a 1.2M-triangle STL, asserting the parse aborts rather than finishing.
+
 ## [1.5.0] - 2026-08-03
 ### Fixed
 - **Component-based 3MF assemblies rendered wrong**: `<component>` transforms were parsed but never applied, so multi-part assemblies (common in CAD exports such as Fusion/SolidWorks) previewed with every sub-part collapsed at the origin, and only the first component appeared at all. Component transforms are now composed with the build-item transform — recursively and cycle-guarded — for both inline components and separate-file components (`p:path`).

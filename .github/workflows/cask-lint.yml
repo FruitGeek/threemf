@@ -1,0 +1,33 @@
+name: Cask lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/cask-lint.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/cask-lint.yml"
+
+jobs:
+  cask-lint:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract cask from release workflow
+        run: |
+          mkdir -p cask-lint/Casks
+          awk '/cat > Casks\/threemf.rb << CASK$/{flag=1;next} /^ *CASK$/{flag=0} flag' \
+            .github/workflows/release.yml \
+            | sed 's/^          //' \
+            | sed -e 's/${VERSION}/1.0.0/' -e "s/\${SHA256}/$(printf '%064d' 0)/" \
+            > cask-lint/Casks/threemf.rb
+          test -s cask-lint/Casks/threemf.rb
+          cat cask-lint/Casks/threemf.rb
+
+      - name: Lint cask
+        run: brew style cask-lint/Casks/threemf.rb
